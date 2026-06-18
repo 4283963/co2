@@ -3,6 +3,8 @@ from typing import List
 from app.schemas.dispatch import PumpStation, DispatchResultItem, DispatchCalculateResponse
 
 _FEASIBILITY_TOLERANCE = 1e-6
+_CARBON_FACTOR = 0.6101
+_TIERED_PRICE_MULTIPLIER = 1.5
 
 
 class DispatchOptimizer:
@@ -22,6 +24,8 @@ class DispatchOptimizer:
         min_flows = np.array([ps.min_flow for ps in pump_stations], dtype=np.float64)
         max_flows = np.array([ps.max_flow for ps in pump_stations], dtype=np.float64)
         power_coeffs = np.array([ps.power_coefficient for ps in pump_stations], dtype=np.float64)
+        base_prices = np.array([ps.base_water_price for ps in pump_stations], dtype=np.float64)
+        tiered_thresholds = np.array([ps.tiered_threshold for ps in pump_stations], dtype=np.float64)
 
         allocated_flows = self._greedy_optimize(
             total_demand, min_flows, max_flows, power_coeffs
@@ -32,21 +36,50 @@ class DispatchOptimizer:
         power_consumptions = allocated_flows * power_coeffs
         total_power = float(np.sum(power_consumptions))
 
+        water_costs = self._calculate_water_costs(allocated_flows, base_prices, tiered_thresholds)
+        carbon_emissions = power_consumptions * _CARBON_FACTOR
+
+        total_water_cost = float(np.sum(water_costs))
+        total_carbon = float(np.sum(carbon_emissions))
+
         results = []
         for i in range(n):
             results.append(DispatchResultItem(
                 id=ids[i],
                 name=names[i],
                 allocated_flow=float(allocated_flows[i]),
-                power_consumption=float(power_consumptions[i])
+                power_consumption=float(power_consumptions[i]),
+                water_cost=float(water_costs[i]),
+                carbon_emission=float(carbon_emissions[i])
             ))
 
         return DispatchCalculateResponse(
             total_demand=total_demand,
             total_power_consumption=total_power,
+            total_water_cost=total_water_cost,
+            total_carbon_emission=total_carbon,
             results=results,
             algorithm=self.algorithm_name
         )
+
+    def _calculate_water_costs(
+        self,
+        allocated_flows: np.ndarray,
+        base_prices: np.ndarray,
+        tiered_thresholds: np.ndarray
+    ) -> np.ndarray:
+        costs = np.zeros_like(allocated_flows)
+        for i in range(len(allocated_flows)):
+            flow = allocated_flows[i]
+            threshold = tiered_thresholds[i]
+            price = base_prices[i]
+            if flow <= threshold:
+                costs[i] = flow * price
+            else:
+                base_cost = threshold * price
+                excess_cost = (flow - threshold) * price * _TIERED_PRICE_MULTIPLIER
+                costs[i] = base_cost + excess_cost
+        return costs
 
     def _validate_and_check_feasibility(
         self, total_demand: float, pump_stations: List[PumpStation]
@@ -65,6 +98,10 @@ class DispatchOptimizer:
                 raise ValueError(f"泵站 {ps.name} 的最高出水量不能小于最低出水量")
             if ps.power_coefficient <= 0:
                 raise ValueError(f"泵站 {ps.name} 的单位耗电系数必须大于0")
+            if ps.base_water_price <= 0:
+                raise ValueError(f"泵站 {ps.name} 的基础水价必须大于0")
+            if ps.tiered_threshold < 0:
+                raise ValueError(f"泵站 {ps.name} 的阶梯水价阈值不能为负数")
             total_min += ps.min_flow
             total_max += ps.max_flow
 
